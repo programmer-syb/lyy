@@ -1,0 +1,95 @@
+/* src/assets/styles/global.scss */
+
+:root {
+    /* 基础背景色：极淡灰蓝 */
+    --bg-color-base: #f8fafc;
+    /* 卡片背景：纯白 */
+    --card-bg: #ffffff;
+    /* 文本颜色 */
+    --text-main: #0f172a;
+    --text-muted: #64748b;
+
+    /* 弥散阴影 */
+    --shadow-soft: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+    --shadow-hover: 0 20px 35px -5px rgba(0, 0, 0, 0.08);
+
+    /* 莫兰迪/渐变主题色 */
+    --color-primary: #6366f1;
+    --color-primary-light: rgba(99, 102, 241, 0.1);
+    --color-success: #10b981;
+
+    /* 超大圆角 */
+    --radius-large: 24px;
+    --radius-medium: 16px;
+    --radius-small: 12px;
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-color-base);
+    color: var(--text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+    -webkit-font-smoothing: antialiased;
+}
+
+/* =========================================
+   Element Plus 深度重塑 (全局生效)
+   ========================================= */
+
+/* 1. 卡片重塑 */
+.el-card {
+    border: none !important;
+    border-radius: var(--radius-large) !important;
+    box-shadow: var(--shadow-soft) !important;
+    background: var(--card-bg) !important;
+    transition: transform 0.3s ease, box-shadow 0.3s ease !important;
+}
+
+.el-card:hover {
+    transform: translateY(-5px);
+    box-shadow: var(--shadow-hover) !important;
+}
+
+/* 2. 按钮重塑 */
+.el-button {
+    border-radius: var(--radius-medium) !important;
+    font-weight: 600 !important;
+    border: none !important;
+    padding: 12px 24px !important;
+    transition: all 0.3s ease !important;
+}
+
+.el-button--primary {
+    background-color: var(--color-primary) !important;
+}
+
+.el-button--primary:hover {
+    transform: scale(1.02);
+    box-shadow: 0 8px 16px -4px rgba(99, 102, 241, 0.3) !important;
+}
+
+/* 3. 输入框重塑 */
+.el-input__wrapper {
+    border-radius: var(--radius-small) !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02) !important;
+    border: 1px solid transparent;
+    background-color: #f1f5f9 !important;
+    transition: all 0.3s ease;
+}
+
+.el-input__wrapper.is-focus {
+    background-color: #fff !important;
+    box-shadow: 0 0 0 2px var(--color-primary-light) !important;
+}
+
+/* 4. 标题与排版 */
+h1,
+h2,
+h3,
+h4,
+h5 {
+    font-weight: 600;
+    letter-spacing: -0.5px;
+    color: var(--text-main);
+}
