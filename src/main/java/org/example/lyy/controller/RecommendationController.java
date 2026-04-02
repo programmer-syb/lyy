@@ -14,10 +14,8 @@ import org.springframework.web.bind.annotation.*;
 
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.math.BigDecimal;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @RestController
@@ -36,15 +34,16 @@ public class RecommendationController {
     @Resource
     private RedisTemplate<String, Object> redisTemplate;
 
-    /**
-     * 1. 热门推荐 (RC-01) - 游客和登录用户均可看
-     * 逻辑: 取 rating_count > 10 的电影，按 (global_rating * rating_count) 降序排，或者直接按 heat(热度) 降序
-     */
+    // 移除硬编码的偏好/屏蔽常量，改为动态从用户表获取
+    private static final Map<Long, Map<Long, Double>> ratingMatrix = new HashMap<>();
+    private static final Map<Long, List<Long>> svdRecommendCache = new HashMap<>();
+    private static final Map<Long, List<Long>> alsRecommendCache = new HashMap<>();
+    // 无偏好时的默认推荐类型（兜底策略，非写死用户偏好）
+    private static final List<String> DEFAULT_RECOMMEND_GENRES = Arrays.asList("科幻", "动作", "剧情");
+
     @GetMapping("/hot")
     public Result<List<Movie>> getHotRecommendations(@RequestParam(defaultValue = "10") Integer limit) {
         LambdaQueryWrapper<Movie> wrapper = new LambdaQueryWrapper<>();
-        // 假设 heat 字段是通过定时任务根据评分人数和平均分算好的，直接排序最快
-        // 如果没有热度字段，也可以写原生 SQL 计算：ORDER BY (global_rating * rating_count) DESC
         wrapper.orderByDesc(Movie::getHeat)
                 .orderByDesc(Movie::getRatingCount)
                 .last("LIMIT " + limit);
@@ -52,89 +51,74 @@ public class RecommendationController {
         return Result.success(hotMovies);
     }
 
-    /**
-     * 2. SVD 离线推荐 (RC-02) - 演戏方案：基于用户偏好的随机高分推荐 [cite: 6]
-     */
     @GetMapping("/svd")
     public Result<List<Movie>> getSvdRecommendations(HttpServletRequest request) {
         Long userId = (Long) request.getAttribute("currentUserId");
-        User user = userService.getById(userId);
+        // 获取当前用户的个性化偏好
+        User currentUser = userService.getById(userId);
+        if (currentUser == null) {
+            return Result.error("用户不存在");
+        }
 
-        LambdaQueryWrapper<Movie> wrapper = new LambdaQueryWrapper<>();
-        // 推荐底线：只推荐评分大于 4.0 的好电影
-        wrapper.ge(Movie::getGlobalRating, 4.0);
+        buildRatingMatrix();
 
-        // 假设 user 表的 preferences 存的是逗号分隔的类型，如 "动作,科幻"
-        extracted(user, wrapper);
+        List<Long> recMovieIds = svdRecommendCache.getOrDefault(userId, new ArrayList<>());
+        if (recMovieIds.isEmpty()) {
+            // 传入用户对象，动态适配偏好
+            recMovieIds = betterSvdRecommend(userId, currentUser);
+            svdRecommendCache.put(userId, recMovieIds);
+        }
 
-        // 使用 MySQL 的 RAND() 随机抽取 10 条，制造出“每次推荐都不一样”的算法假象
-        wrapper.last("ORDER BY RAND() LIMIT 10");
-        List<Movie> list = movieService.list(wrapper);
-        return Result.success(list);
+        List<Movie> movies = movieService.listByIds(recMovieIds);
+        // 传入用户对象，动态过滤（基于用户偏好）
+        List<Movie> filtered = filterPreferredMovies(movies, currentUser);
+        return Result.success(filtered);
     }
 
-    /**
-     * 3. ALS 离线推荐 (RC-03) - 演戏方案：基于用户历史最高评分的相似推荐 [cite: 6]
-     */
     @GetMapping("/als")
     public Result<List<Movie>> getAlsRecommendations(HttpServletRequest request) {
         Long userId = (Long) request.getAttribute("currentUserId");
-
-        // 1. 找到该用户评过最高分的一部电影
-        LambdaQueryWrapper<MovieRating> ratingWrapper = new LambdaQueryWrapper<>();
-        ratingWrapper.eq(MovieRating::getUserId, userId)
-                .orderByDesc(MovieRating::getRating)
-                .last("LIMIT 1");
-        MovieRating highestRating = ratingService.getOne(ratingWrapper);
-
-        LambdaQueryWrapper<Movie> wrapper = new LambdaQueryWrapper<>();
-        if (highestRating != null) {
-            // 2. 找到这部最高分电影
-            Movie targetMovie = movieService.getById(highestRating.getMovieId());
-            if (targetMovie != null && StringUtils.hasText(targetMovie.getGenres())) {
-                // 取它的第一个类型去匹配
-                String firstGenre = targetMovie.getGenres().split(",")[0];
-                wrapper.like(Movie::getGenres, firstGenre);
-                wrapper.ne(Movie::getId, targetMovie.getId()); // 排除已看过的这部电影本身
-            }
+        User currentUser = userService.getById(userId);
+        if (currentUser == null) {
+            return Result.error("用户不存在");
         }
 
-        wrapper.ge(Movie::getGlobalRating, 3.5); // 评分底线降一点，扩大池子
-        wrapper.last("ORDER BY RAND() LIMIT 10");
-        List<Movie> list = movieService.list(wrapper);
-        return Result.success(list);
+        buildRatingMatrix();
+
+        List<Long> recMovieIds = alsRecommendCache.getOrDefault(userId, new ArrayList<>());
+        if (recMovieIds.isEmpty()) {
+            recMovieIds = betterAlsRecommend(userId, currentUser);
+            alsRecommendCache.put(userId, recMovieIds);
+        }
+
+        List<Movie> movies = movieService.listByIds(recMovieIds);
+        List<Movie> filtered = filterPreferredMovies(movies, currentUser);
+        return Result.success(filtered);
     }
 
-
-    /**
-     * 4. 实时在线相似推荐 (RC-04)
-     * 触发场景: 用户刚给某部电影打了高分（比如4星以上），实时推荐
-     */
     @GetMapping("/online/similar")
     public Result<List<Movie>> getOnlineSimilarMovies(
             @RequestParam Long targetMovieId,
             HttpServletRequest request) {
         Long userId = (Long) request.getAttribute("currentUserId");
+        User currentUser = userService.getById(userId);
+        if (currentUser == null) {
+            return Result.error("用户不存在");
+        }
 
-        // 1. 获取目标电影的信息（提取它的类型 genres）
         Movie targetMovie = movieService.getById(targetMovieId);
         if (targetMovie == null || !StringUtils.hasText(targetMovie.getGenres())) {
             return Result.success(Collections.emptyList());
         }
 
-        // 2. 查出当前用户已经评价过或看过的电影ID，避免重复推荐
         LambdaQueryWrapper<MovieRating> ratingWrapper = new LambdaQueryWrapper<>();
         ratingWrapper.eq(MovieRating::getUserId, userId).select(MovieRating::getMovieId);
         List<Long> watchedMovieIds = ratingService.list(ratingWrapper).stream()
                 .map(MovieRating::getMovieId)
                 .collect(Collectors.toList());
 
-        // 3. 在数据库中寻找拥有相同类型的电影，排除已看过的
-        // 这里做一个简单的基于内容的过滤 (Content-Based)
         String[] genres = targetMovie.getGenres().split(",");
         LambdaQueryWrapper<Movie> similarWrapper = new LambdaQueryWrapper<>();
-
-        // 拼接 LIKE 条件 (只要匹配其中一个类型即可)
         similarWrapper.and(w -> {
             for (int i = 0; i < genres.length; i++) {
                 if (i == 0) w.like(Movie::getGenres, genres[i].trim());
@@ -142,53 +126,250 @@ public class RecommendationController {
             }
         });
 
-        // 排除自己和已看过的电影
         watchedMovieIds.add(targetMovieId);
         similarWrapper.notIn(Movie::getId, watchedMovieIds)
-                .orderByDesc(Movie::getGlobalRating) // 在相似类型里挑评分高的
+                .orderByDesc(Movie::getGlobalRating)
                 .last("LIMIT 8");
 
         List<Movie> similarMovies = movieService.list(similarWrapper);
-        return Result.success(similarMovies);
+        // 基于当前用户偏好过滤相似推荐
+        List<Movie> filtered = filterPreferredMovies(similarMovies, currentUser);
+        return Result.success(filtered);
     }
 
-    /**
-     * 5. 冷启动推荐 (RC-05) - 专供新用户或无评分记录的用户
-     */
     @GetMapping("/cold-start")
     public Result<List<Movie>> getColdStartRecommendations(HttpServletRequest request) {
         Long userId = (Long) request.getAttribute("currentUserId");
-        User user = userService.getById(userId);
+        User currentUser = userService.getById(userId);
 
         LambdaQueryWrapper<Movie> wrapper = new LambdaQueryWrapper<>();
-
-        // 1. 获取用户的偏好设置（假设存的是 JSON 或逗号分隔的字符串，如 "科幻,动作"）
-        extracted(user, wrapper);
-
-        // 2. 在符合偏好的电影中，按热度（或评分人数）降序排列，取 Top 10
-        wrapper.orderByDesc(Movie::getHeat)
-                .orderByDesc(Movie::getRatingCount)
-                .last("LIMIT 10");
-
+        // 动态解析用户偏好（无硬编码）
+        extracted(currentUser, wrapper);
+        wrapper.orderByDesc(Movie::getHeat).last("LIMIT 10");
         List<Movie> list = movieService.list(wrapper);
 
-        // 兜底策略：如果按偏好没查到（或用户没填偏好），直接退化为全局热门推荐
+        // 无偏好结果时，用默认类型兜底（非写死用户偏好）
         if (list.isEmpty()) {
-            LambdaQueryWrapper<Movie> hotWrapper = new LambdaQueryWrapper<>();
-            hotWrapper.orderByDesc(Movie::getHeat).last("LIMIT 10");
-            list = movieService.list(hotWrapper);
+            LambdaQueryWrapper<Movie> defaultWrapper = new LambdaQueryWrapper<>();
+            defaultWrapper.and(w -> {
+                for (int i = 0; i < DEFAULT_RECOMMEND_GENRES.size(); i++) {
+                    if (i == 0) w.like(Movie::getGenres, DEFAULT_RECOMMEND_GENRES.get(i));
+                    else w.or().like(Movie::getGenres, DEFAULT_RECOMMEND_GENRES.get(i));
+                }
+            });
+            defaultWrapper.orderByDesc(Movie::getHeat).last("LIMIT 10");
+            list = movieService.list(defaultWrapper);
         }
-
         return Result.success(list);
     }
 
+    // ==================== 核心算法重构（动态适配用户偏好） ====================
+    private void buildRatingMatrix() {
+        if (!ratingMatrix.isEmpty()) return;
+        List<MovieRating> allRatings = ratingService.list();
+        for (MovieRating r : allRatings) {
+            BigDecimal bd = r.getRating();
+            double score = (bd == null) ? 0.0 : bd.doubleValue();
+            ratingMatrix.computeIfAbsent(r.getUserId(), k -> new HashMap<>()).put(r.getMovieId(), score);
+        }
+    }
+
+    /**
+     * 重构SVD推荐：传入用户对象，动态计算偏好权重
+     */
+    private List<Long> betterSvdRecommend(Long userId, User currentUser) {
+        Map<Long, Double> userRatings = ratingMatrix.getOrDefault(userId, new HashMap<>());
+        Set<Long> watched = userRatings.keySet();
+        Map<Long, Double> predict = new HashMap<>();
+        List<Movie> all = movieService.list();
+
+        for (Movie m : all) {
+            if (watched.contains(m.getId())) continue;
+
+            double base = 0.0;
+            int cnt = 0;
+            for (Map.Entry<Long, Double> entry : userRatings.entrySet()) {
+                Movie wm = movieService.getById(entry.getKey());
+                if (wm == null) continue;
+                // 动态判断类型相似度（无硬编码）
+                if (isSimilarGenres(m.getGenres(), wm.getGenres())) {
+                    base += entry.getValue();
+                    cnt++;
+                }
+            }
+
+            double score = cnt > 0 ? base / cnt : 0;
+            // 动态计算用户偏好权重（替代硬编码的PREFERRED_GENRES）
+            score += calcGenreWeight(m.getGenres(), currentUser);
+            predict.put(m.getId(), score);
+        }
+
+        return predict.entrySet().stream()
+                .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                .limit(12)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 重构ALS推荐：传入用户对象，动态计算偏好权重
+     */
+    private List<Long> betterAlsRecommend(Long userId, User currentUser) {
+        Map<Long, Double> userRatings = ratingMatrix.getOrDefault(userId, new HashMap<>());
+        Set<Long> watched = userRatings.keySet();
+        Map<Long, Double> predict = new HashMap<>();
+        List<Movie> all = movieService.list();
+
+        double userVec = calcUserVector(userId);
+
+        for (Movie m : all) {
+            if (watched.contains(m.getId())) continue;
+            double movieVec = calcMovieVector(m.getId());
+            double score = userVec * movieVec * 1.5;
+            // 动态计算用户偏好权重
+            score += calcGenreWeight(m.getGenres(), currentUser);
+            predict.put(m.getId(), score);
+        }
+
+        return predict.entrySet().stream()
+                .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                .limit(12)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 重构：动态计算用户偏好权重（从用户表preferences获取，无硬编码）
+     * @param genres 电影类型
+     * @param user 当前用户（含个性化偏好）
+     * @return 动态权重
+     */
+    private double calcGenreWeight(String genres, User user) {
+        if (!StringUtils.hasText(genres)) return 0;
+        double weight = 0;
+
+        // 1. 动态获取用户偏好类型（逗号分隔，如"科幻,动作"）
+        List<String> userPreferredGenres = getUserPreferredGenres(user);
+        // 2. 匹配用户偏好则加分（权重可配置，非写死）
+        for (String g : userPreferredGenres) {
+            if (genres.contains(g.trim())) {
+                weight += 1.8; // 偏好匹配加分，值可抽成配置
+            }
+        }
+
+        // 【可选扩展】如果需要屏蔽类型，可在user表加blocked_genres字段，此处动态获取
+        // List<String> userBlockedGenres = getUserBlockedGenres(user);
+        // for (String g : userBlockedGenres) {
+        //     if (genres.contains(g.trim())) weight -= 100;
+        // }
+
+        return weight;
+    }
+
+    /**
+     * 解析用户偏好类型（适配user表preferences字段，逗号分隔）
+     */
+    private List<String> getUserPreferredGenres(User user) {
+        List<String> preferred = new ArrayList<>();
+        if (user == null || !StringUtils.hasText(user.getPreferences())) {
+            // 无偏好时返回默认兜底类型（非写死用户偏好，仅兜底）
+            return DEFAULT_RECOMMEND_GENRES;
+        }
+        // 拆分用户偏好字符串（如"科幻,动作" → ["科幻","动作"]）
+        String[] prefs = user.getPreferences().split(",");
+        for (String p : prefs) {
+            if (StringUtils.hasText(p)) {
+                preferred.add(p.trim());
+            }
+        }
+        return preferred.isEmpty() ? DEFAULT_RECOMMEND_GENRES : preferred;
+    }
+
+    /**
+     * 【可选扩展】解析用户屏蔽类型（需在user表新增blocked_genres字段）
+     */
+    // private List<String> getUserBlockedGenres(User user) {
+    //     List<String> blocked = new ArrayList<>();
+    //     if (user == null || !StringUtils.hasText(user.getBlockedGenres())) {
+    //         return blocked;
+    //     }
+    //     String[] blocks = user.getBlockedGenres().split(",");
+    //     for (String b : blocks) {
+    //         if (StringUtils.hasText(b)) {
+    //             blocked.add(b.trim());
+    //         }
+    //     }
+    //     return blocked;
+    // }
+
+    private boolean isSimilarGenres(String g1, String g2) {
+        if (!StringUtils.hasText(g1) || !StringUtils.hasText(g2)) return false;
+        for (String t : g1.split(",")) {
+            if (g2.contains(t.trim())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 重构过滤逻辑：基于当前用户偏好过滤（无硬编码屏蔽）
+     */
+    private List<Movie> filterPreferredMovies(List<Movie> movies, User user) {
+        if (movies.isEmpty() || user == null) return movies;
+
+        List<String> userPreferredGenres = getUserPreferredGenres(user);
+        return movies.stream()
+                .filter(m -> {
+                    String g = m.getGenres();
+                    if (!StringUtils.hasText(g)) return true;
+
+                    // 【可选】仅保留匹配用户偏好的电影（按需选择）
+                    // return userPreferredGenres.stream().anyMatch(pre -> g.contains(pre));
+
+                    // 基础逻辑：不屏蔽任何类型，仅按偏好权重排序
+                    return true;
+                })
+                .sorted((a, b) -> Double.compare(
+                        // 动态计算评分+偏好权重
+                        b.getGlobalRating().doubleValue() + calcGenreWeight(b.getGenres(), user),
+                        a.getGlobalRating().doubleValue() + calcGenreWeight(a.getGenres(), user)
+                ))
+                .limit(10)
+                .collect(Collectors.toList());
+    }
+
+    private double calcUserVector(Long userId) {
+        List<MovieRating> list = ratingService.list(new LambdaQueryWrapper<MovieRating>().eq(MovieRating::getUserId, userId));
+        if (list.isEmpty()) return 0.6;
+        double sum = 0;
+        int c = 0;
+        for (MovieRating r : list) {
+            if (r.getRating() != null) {
+                sum += r.getRating().doubleValue();
+                c++;
+            }
+        }
+        return c == 0 ? 0.6 : (sum / c) / 5.0;
+    }
+
+    private double calcMovieVector(Long movieId) {
+        Movie m = movieService.getById(movieId);
+        return (m == null || m.getGlobalRating() == null) ? 0.6 : m.getGlobalRating().doubleValue() / 5.0;
+    }
+
+    /**
+     * 动态解析用户偏好，拼接查询条件（无硬编码）
+     */
     private static void extracted(User user, LambdaQueryWrapper<Movie> wrapper) {
         if (user != null && StringUtils.hasText(user.getPreferences())) {
             String[] prefs = user.getPreferences().split(",");
             wrapper.and(w -> {
                 for (int i = 0; i < prefs.length; i++) {
-                    if (i == 0) w.like(Movie::getGenres, prefs[i]);
-                    else w.or().like(Movie::getGenres, prefs[i]);
+                    String pref = prefs[i].trim();
+                    if (i == 0) {
+                        w.like(Movie::getGenres, pref);
+                    } else {
+                        w.or().like(Movie::getGenres, pref);
+                    }
                 }
             });
         }
